@@ -172,6 +172,7 @@ static void sort_kernel(
     int64_t dim,
     bool descending,
     bool stable) {
+  _fill_values(values, self);
   dim = maybe_wrap_dim(dim, values.dim());
   _fill_indices(indices, dim);
   if (self.stride(dim) == 0) {

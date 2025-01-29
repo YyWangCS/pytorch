@@ -24,5 +24,5 @@ DECLARE_DISPATCH(sort_fn, sort_stub)
 DECLARE_DISPATCH(topk_fn, topk_stub)
 
 void _fill_indices(const TensorBase &indices, int64_t dim);
-
+void _fill_values(const TensorBase &values_base, const TensorBase &self_base);
 } // namespace at::native

@@ -105,6 +105,19 @@ void _fill_indices(const TensorBase &indices, int64_t dim) {
   OptionalTensorRef(indices)->copy_(idx_dim_restrided);
 }
 
+void _fill_values(const TensorBase &values_base, const TensorBase &self_base) {
+#define TOTENSOR(BASE, VAR)           \
+  OptionalTensorRef opt_##BASE(BASE); \
+  const Tensor& VAR = *opt_##BASE;
+
+  // Converting TensorBase into Tensor.
+  // We will need Tensor's methods from this point onwards.
+  TOTENSOR(self_base, self);
+  TOTENSOR(values_base, values);
+  values.copy_(self);
+}
+
+
 namespace {
 
 /* Note from TH:
@@ -944,7 +957,6 @@ TORCH_IMPL_FUNC(sort_stable_out)
  bool descending,
  const Tensor& values,
  const Tensor& indices) {
-  values.copy_(self);
   // check if self is scalar
   if (self.dim() == 0 && self.numel() == 1) {
     indices.zero_();
