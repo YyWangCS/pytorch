@@ -246,7 +246,7 @@ __global__ void fill(T* x, T value, IndexType size) {
 // for largest topk, k_to_find = slice_size - k + 1
 template <typename T, typename IndexType, typename Bitwise, int Dim>
 C10_LAUNCH_BOUNDS_1(BLOCK_THREADS)
-__global__ void radixFindKthValues(
+__global__ void perBlockHistogram(
     at::cuda::detail::TensorInfo<const T, IndexType> input,
     uint32_t slice_size,
     uint32_t* ks_to_find,  // size: num_slices, unused arg but for mysterious reasons perf is better when it's present
@@ -321,12 +321,41 @@ __global__ void radixFindKthValues(
   }
 }
 
+__global__ void perSlicePrefixSum(
+  short* counts, 
+  uint32_t* prefix_sum,
+  int32_t blocks_per_slice) {
+  int tidx = threadIdx.x + blockIdx.x * blockDim.x;
+  uint32_t block_idx = blockIdx.x;
+  uint32_t slice_idx = block_idx;
+  
+  typedef cub::BlockScan<uint32_t, BLOCK_THREADS> BlockScan;
+  typename BlockScan::TempStorage scan_storage;
+
+  // accumulates counters from multiple blocks
+  uint32_t digit_count = 0;
+  if (tidx < RADIX_DIGITS) {
+    for (int blk = 0; blk < blocks_per_slice; ++blk) {
+      digit_count += counts[(slice_idx * blocks_per_slice + blk) * RADIX_DIGITS + tidx];
+    }
+  }
+
+  // compute the block-wide inclusive prefix sum
+  uint32_t digit_count_cumsum;
+  BlockScan(scan_storage).InclusiveSum(digit_count, digit_count_cumsum);
+  __syncthreads();
+  if (tidx < RADIX_DIGITS) {
+    prefix_sum[tidx] = digit_count_cumsum;
+  }
+}
+
 // Assumption: k can not be larger than UINT32_MAX
 template <typename Bitwise, typename T>
 C10_LAUNCH_BOUNDS_1(RADIX_DIGITS)  // one thread per digit
 __global__ void computeBlockwiseWithinKCounts(
   Bitwise* desires_in,          // size: num_slices
   short* counts,             // size: num_slices * blocks_per_slice * radix_digits
+  uint32_t* prefix_sum,
   uint32_t* ks_to_find_in,  // size: num_slices
   uint32_t blocks_per_slice,
   int current_bit,
@@ -338,7 +367,7 @@ __global__ void computeBlockwiseWithinKCounts(
   Bitwise* desires_out,
   uint32_t num_blocks
 ) {
-  // This kernel should be launched with the same number of blocks as the `radixFindKthValues` kernel.
+  // This kernel should be launched with the same number of blocks as the `perBlockHistogram` kernel.
   int tidx = threadIdx.x;
   uint32_t block_idx = getLinearBlockId<uint32_t>();
   uint32_t slice_idx = block_idx / blocks_per_slice;
@@ -351,36 +380,15 @@ __global__ void computeBlockwiseWithinKCounts(
   if (block_idx >= num_blocks) {
     return;
   }
-  typedef cub::BlockScan<uint32_t, BLOCK_THREADS> BlockScan;
-  union __align__(16) TempStorage {
-    uint32_t digit_count_cumsum[RADIX_DIGITS]; // only used if this it the last block for this slice
-    typename BlockScan::TempStorage scan_storage;
-  };
-  __shared__ TempStorage temp_storage;
 
-  // accumulates counters from multiple blocks
-  uint32_t digit_count = 0;
-  if (tidx < RADIX_DIGITS) {
-    for (int blk = 0; blk < blocks_per_slice; ++blk) {
-      digit_count += counts[(slice_idx * blocks_per_slice + blk) * RADIX_DIGITS + tidx];
-    }
-  }
-
-  // compute the block-wide inclusive prefix sum
-  uint32_t digit_count_cumsum;
-  BlockScan(temp_storage.scan_storage).InclusiveSum(digit_count, digit_count_cumsum);
-  __syncthreads();
-  // every thread also need the perfix_sum of it's left value for comparison, so save a copy in shared mem
-  if (tidx < RADIX_DIGITS) {
-    temp_storage.digit_count_cumsum[tidx] = digit_count_cumsum;
-  }
-  __syncthreads();
+  uint32_t digit_count_cumsum[RADIX_DIGITS];
+  digit_count_cumsum[tidx] = prefix_sum[slice_idx*RADIX_DIGITS + tidx];
 
   __shared__ Bitwise desired;
   uint32_t k_to_find = ks_to_find_in[slice_idx];
 
   if (tidx < RADIX_DIGITS) {
-    uint32_t digit_count_cumsum_left = (tidx == 0) ? 0 : temp_storage.digit_count_cumsum[tidx - 1];
+    uint32_t digit_count_cumsum_left = (tidx == 0) ? 0 : digit_count_cumsum[tidx - 1];
 
     // if not the last pass: update desired and ks_to_find
     // if last pass: write out the kth value
@@ -462,7 +470,7 @@ template <typename Bitwise>
 __global__ void computeBlockwiseKthCounts(
   Bitwise* desires,            // size: num_slices
   short* counts,               // size: num_slices * blocks_per_slice * radix_digits
-  uint32_t num_blocks,         // the number of blocks used by `radixFindKthValues` kernel
+  uint32_t num_blocks,         // the number of blocks used by `perBlockHistogram` kernel
   uint32_t blocks_per_slice,
   // outputs:
   uint32_t* kthCounts          // size: num_slices * blocks_per_slice == num_blocks
@@ -645,9 +653,7 @@ void launch(
   T* kthValues = reinterpret_cast<T*>(kthValues_buffer.get());
 
   TORCH_CHECK(blocks_per_slice <= std::numeric_limits<uint32_t>::max(), "blocks_per_slice larger than uint32 maximum is not supported");
-  auto semaphores_buffer = allocator.allocate(numInputSlices * sizeof(uint32_t));
-  uint32_t* semaphores = reinterpret_cast<uint32_t*>(semaphores_buffer.get());
-  AT_CUDA_CHECK(cudaMemsetAsync(semaphores, 0, numInputSlices * sizeof(uint32_t), stream));
+
 
   auto ks_to_find_buffer = allocator.allocate(2 * numInputSlices * sizeof(uint32_t));
   uint32_t* ks_to_find = reinterpret_cast<uint32_t*>(ks_to_find_buffer.get());
@@ -663,6 +669,10 @@ void launch(
   short* counts = reinterpret_cast<short*>(counts_buffer.get());
   static_assert(MAX_ITEMS_PER_THREAD * BLOCK_THREADS < std::numeric_limits<short>::max(),
     "blockwise counter too large");
+
+  auto prefix_sum_buffer = allocator.allocate(numInputSlices * sizeof(uint32_t));
+  uint32_t* prefix_sum = reinterpret_cast<uint32_t*>(prefix_sum_buffer.get());
+  AT_CUDA_CHECK(cudaMemsetAsync(prefix_sum, 0, numInputSlices * sizeof(uint32_t), stream));
 
 #if CUB_SUPPORTS_SCAN_BY_KEY()
   auto withinKCounts_buffer = allocator.allocate(num_blocks * sizeof(uint32_t));
@@ -687,7 +697,7 @@ void launch(
 
   // iterate radix bits for multiple passes
   for (int current_bit = sizeof(T) * 8 - RADIX_BITS; current_bit >= 0; current_bit -= RADIX_BITS) {
-    radixFindKthValues<T, IndexType, Bitwise, Dim><<<grid, block, 0, stream>>>(
+    perBlockHistogram<T, IndexType, Bitwise, Dim><<<grid, block, 0, stream>>>(
         input,
         inputSliceSize,
         ks_to_find_in, // unused arg
@@ -700,6 +710,8 @@ void launch(
         desired_in,
         counts);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    perSlicePrefixSum<<<numInputSlices, RADIX_DIGITS>>>(counts, prefix_sum, blocks_per_slice);
+
     // we unconditionally call this kernel to update desired/ks_to_find/kthValues
     // if cub supports scan_by_key we additionally do k counts
     computeBlockwiseWithinKCounts<Bitwise, T><<<grid, RADIX_DIGITS, 0, stream>>>(
