@@ -230,7 +230,7 @@ constexpr int BLOCK_THREADS = 256;
 constexpr int RADIX_BITS = 8;
 constexpr int RADIX_DIGITS = 1 << RADIX_BITS; // 2 ^ RADIX_BITS
 constexpr int RADIX_MASK = (RADIX_DIGITS - 1);
-static_assert(RADIX_DIGITS <= BLOCK_THREADS, "radixFindKthValues kernel requires RADIX_DIGITS <= BLOCK_THREADS");
+static_assert(RADIX_DIGITS <= BLOCK_THREADS, "RADIX_DIGITS must be <= BLOCK_THREADS");
 constexpr int MIN_ITEMS_PER_THREAD = 4;
 constexpr int MAX_ITEMS_PER_THREAD = 64;
 
@@ -245,7 +245,7 @@ __global__ void fill(T* x, T value, IndexType size) {
 // compute local histogram for each block
 template <typename T, typename IndexType, typename Bitwise, int Dim>
 C10_LAUNCH_BOUNDS_1(BLOCK_THREADS)
-__global__ void computeBlockHistogram(
+__global__ void computeBlockDigitCounts(
     at::cuda::detail::TensorInfo<const T, IndexType> input,
     uint32_t slice_size,
     uint32_t* ks_to_find,  // size: num_slices, unused arg but for mysterious reasons perf is better when it's present
@@ -324,30 +324,27 @@ __global__ void computeBlockHistogram(
 __global__ void computeDigitCumSum(
   short* counts, 
   uint32_t* digit_cum_sum,
-  int32_t blocks_per_slice) {
+  uint32_t blocks_per_slice) {
   int tidx = threadIdx.x + blockIdx.x * blockDim.x;
   int digit_idx = threadIdx.x;
-  uint32_t block_idx = blockIdx.x;
-  uint32_t slice_idx = block_idx;
+  uint32_t slice_idx = blockIdx.x;
   
   typedef cub::BlockScan<uint32_t, BLOCK_THREADS> BlockScan;
-  __shared__ BlockScan::TempStorage scan_storage;
+  __shared__ typename BlockScan::TempStorage scan_storage;
   // accumulates counters from multiple blocks
   uint32_t digit_count = 0;
   if (threadIdx.x < RADIX_DIGITS) {
-    uint32_t rounds = blocks_per_slice / 8;
+    constexpr int HISTO_ACCUM_TILE = 4;
+    uint32_t rounds = blocks_per_slice / HISTO_ACCUM_TILE;
     for (int iter = 0; iter < rounds; iter++)  {
-      int blk = 8 * iter;
-      digit_count += counts[(slice_idx * blocks_per_slice + blk) * RADIX_DIGITS + digit_idx];
-      digit_count += counts[(slice_idx * blocks_per_slice + blk + 1) * RADIX_DIGITS + digit_idx];
-      digit_count += counts[(slice_idx * blocks_per_slice + blk + 2) * RADIX_DIGITS + digit_idx];
-      digit_count += counts[(slice_idx * blocks_per_slice + blk + 3) * RADIX_DIGITS + digit_idx];
-      digit_count += counts[(slice_idx * blocks_per_slice + blk + 4) * RADIX_DIGITS + digit_idx];
-      digit_count += counts[(slice_idx * blocks_per_slice + blk + 5) * RADIX_DIGITS + digit_idx];
-      digit_count += counts[(slice_idx * blocks_per_slice + blk + 6) * RADIX_DIGITS + digit_idx];
-      digit_count += counts[(slice_idx * blocks_per_slice + blk + 7) * RADIX_DIGITS + digit_idx];
+      int base = HISTO_ACCUM_TILE * iter;
+      #pragma unroll
+      for (int j = 0; j < HISTO_ACCUM_TILE; j++) {
+        int blk = base + j;
+        digit_count += counts[(slice_idx * blocks_per_slice + blk) * RADIX_DIGITS + digit_idx];
+      }
     }
-    for (int blk = 8 * rounds; blk < blocks_per_slice; blk++)  {
+    for (int blk = HISTO_ACCUM_TILE * rounds; blk < blocks_per_slice; blk++)  {
       digit_count += counts[(slice_idx * blocks_per_slice + blk) * RADIX_DIGITS + digit_idx];
     }
 
@@ -379,7 +376,7 @@ __global__ void computeBlockwiseWithinKCounts(
   Bitwise* desires_out,
   uint32_t num_blocks
 ) {
-  // This kernel should be launched with the same number of blocks as the `computeBlockHistogram` kernel.
+  // This kernel should be launched with the same number of blocks as the `computeBlockDigitCounts` kernel.
   int tidx = threadIdx.x;
   uint32_t block_idx = getLinearBlockId<uint32_t>();
   uint32_t slice_idx = block_idx / blocks_per_slice;
@@ -482,7 +479,7 @@ template <typename Bitwise>
 __global__ void computeBlockwiseKthCounts(
   Bitwise* desires,            // size: num_slices
   short* counts,               // size: num_slices * blocks_per_slice * radix_digits
-  uint32_t num_blocks,         // the number of blocks used by `computeBlockHistogram` kernel
+  uint32_t num_blocks,         // the number of blocks used by `computeBlockDigitCounts` kernel
   uint32_t blocks_per_slice,
   // outputs:
   uint32_t* kthCounts          // size: num_slices * blocks_per_slice == num_blocks
@@ -709,7 +706,7 @@ void launch(
 
   // iterate radix bits for multiple passes
   for (int current_bit = sizeof(T) * 8 - RADIX_BITS; current_bit >= 0; current_bit -= RADIX_BITS) {
-    computeBlockHistogram<T, IndexType, Bitwise, Dim><<<grid, block, 0, stream>>>(
+    computeBlockDigitCounts<T, IndexType, Bitwise, Dim><<<grid, block, 0, stream>>>(
         input,
         inputSliceSize,
         ks_to_find_in, // unused arg
