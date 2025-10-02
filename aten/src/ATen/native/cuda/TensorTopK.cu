@@ -320,7 +320,7 @@ __global__ void computeBlockDigitCounts(
   }
 }
 
-// compute global histogram and cumsum for each block
+// compute global histogram and cumsum for each row
 __global__ void computeDigitCumSum(
   short* counts, 
   uint32_t* digit_cum_sum,
@@ -329,7 +329,7 @@ __global__ void computeDigitCumSum(
   int digit_idx = threadIdx.x;
   uint32_t slice_idx = blockIdx.x;
   
-  typedef cub::BlockScan<uint32_t, BLOCK_THREADS> BlockScan;
+  typedef cub::BlockScan<uint32_t, RADIX_DIGITS> BlockScan;
   __shared__ typename BlockScan::TempStorage scan_storage;
   // accumulates counters from multiple blocks
   uint32_t digit_count = 0;
